@@ -1682,13 +1682,14 @@ class CtYunClient {
       }
     }
 
-    if (!desktopInfo || !desktopInfo.clinkLvsOutHost) {
+    const targetHost = desktopInfo.clinkLvsOutHost || desktopInfo.clinkLvsInHost;
+    if (!desktopInfo || !targetHost) {
       appendLog('KeepAlive', `[${accName}][${desktopName}] 视讯网关暂未分配完毕 (已重试 ${maxConnAttempts} 次)，跳过本次连接`, 'warning');
       return { success: false, reason: 'no_gateway' };
     }
 
-    this.metrics.currentHost = desktopInfo.clinkLvsOutHost;
-    const wsUrl = `wss://${desktopInfo.clinkLvsOutHost}/clinkProxy/${desktopId}/MAIN`;
+    this.metrics.currentHost = targetHost;
+    const wsUrl = `wss://${targetHost}/clinkProxy/${desktopId}/MAIN`;
 
     return await new Promise((resolveSession) => {
       let cycleDone = false;
@@ -1796,7 +1797,7 @@ class CtYunClient {
 
         appendLog('Heartbeat', `[${accName}][${desktopName}] 🟢 保活长连接就绪 (${this.metrics.currentHost})`, 'success');
 
-        const hostParts = (desktopInfo.clinkLvsOutHost || '').split(':');
+        const hostParts = (targetHost || '').split(':');
         const connectMsg = {
           type: 1,
           ssl: 1,

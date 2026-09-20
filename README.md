@@ -96,7 +96,9 @@ docker run -d \
   -p 8571:8571 \
   -v $(pwd)/data:/app/data \
   --restart unless-stopped \
-  ghcr.io/muyicn/ctyun-dashboard:latest
+  ghcr.io/lusean23/ctyun-dashboard:latest
+# 或 Docker Hub 官方源：
+  lusean23/ctyun-dashboard:latest
 ```
 
 #### 2. 使用 `docker-compose.yml` 部署：
@@ -106,7 +108,7 @@ version: '3.8'
 
 services:
   ctyun-dashboard:
-    image: learycn/ctyun-dashboard:latest # 或 ghcr.io/muyicn/ctyun-dashboard:latest
+    image: lusean23/ctyun-dashboard:latest
     container_name: ctyun-dashboard
     restart: unless-stopped
     ports:
