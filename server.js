@@ -1011,7 +1011,14 @@ class CtYunClient {
             os: spec.os,
             specStr: spec.specStr,
             objType: item.objType ?? 0,
-            isPool: false
+            isPool: false,
+            // 保留官方区域接入信息，connectMaster/reportOnline 必须走该区域节点
+            backupurl: Array.isArray(item.backupurl) ? item.backupurl : [],
+            connectUrl: Array.isArray(item.connectUrl) ? item.connectUrl : [],
+            connectMaster: item.connectMaster,
+            connectApiUrl: item.connectApiUrl || null,
+            foreignDesktopId: item.foreignDesktopId || '',
+            regionId: item.regionId || null
           });
         }
       }
@@ -1386,6 +1393,89 @@ class CtYunClient {
     throw new Error(json.msg || '获取云电脑连接配置失败');
   }
 
+  // 抓包确认的官方 Android 连接流程：区域 connectMaster -> reportOnline。
+  // 这里不再伪造 clinkProxy WebSocket/REDQ 协议，而是直接调用官方连接状态接口。
+  getOfficialDesktopBase(desktop = {}) {
+    const candidates = [
+      ...(Array.isArray(desktop.backupurl) ? desktop.backupurl : []),
+      ...(Array.isArray(desktop.connectUrl) ? desktop.connectUrl : [])
+    ].filter(Boolean);
+    return String(candidates[0] || 'https://desk.ctyun.cn:8810').replace(/\/$/, '');
+  }
+
+  async connectMasterOfficial(desktop, vdCommand = '') {
+    if (!this.loginInfo) throw new Error('未登录');
+
+    const desktopId = String(desktop.objId || desktop.desktopId || '');
+    if (!desktopId) throw new Error('缺少云电脑 ID');
+
+    const baseUrl = this.getOfficialDesktopBase(desktop);
+    const connectPath = desktop.connectApiUrl?.connectPath || '/api/desktop/client/connectMaster';
+    const body = new URLSearchParams({
+      deviceType: this.deviceType,
+      sysVersion: 'Windows NT 10.0; Win64; x64',
+      appVersion: '3.2.0',
+      vdCommand: vdCommand || '',
+      hardwareFeatureCode: this.account.deviceCode || '',
+      ipAddress: '',
+      deviceCode: this.account.deviceCode || '',
+      clientVersion: this.version,
+      'CTG-APPMODEL': '1',
+      deviceName: 'Chrome浏览器',
+      deviceId: this.deviceType,
+      appChannel: '1010100',
+      loginDesktopType: '2',
+      connectMaster: '1',
+      objId: desktopId,
+      osType: this.deviceType,
+      ignoreAoneCheck: '0',
+      producer: 'Chrome',
+      specifiedCertCategory: '1',
+      deviceModel: 'Windows NT 10.0; Win64; x64',
+      objType: String(desktop.objType ?? 0)
+    });
+
+    const headers = this.getSignedHeaders({
+      'Content-Type': 'application/x-www-form-urlencoded',
+      desktopid: desktopId
+    });
+    if (desktop.foreignDesktopId) headers['x-vm-id'] = desktop.foreignDesktopId;
+
+    const res = await fetchWithTimeout(`${baseUrl}${connectPath}`, {
+      method: 'POST',
+      headers,
+      body: body.toString()
+    });
+    const json = await res.json();
+    if (json.code !== 0 || !json.data?.desktopInfo) {
+      throw new Error(json.msg || '官方 connectMaster 未返回连接信息');
+    }
+
+    const desktopInfo = json.data.desktopInfo;
+    desktopInfo._officialBaseUrl = baseUrl;
+    return desktopInfo;
+  }
+
+  async reportOnlineOfficial(desktop, desktopInfo) {
+    const desktopId = String(desktop.objId || desktop.desktopId || desktopInfo?.desktopId || '');
+    const baseUrl = desktopInfo?._officialBaseUrl || this.getOfficialDesktopBase(desktop);
+    const headers = this.getSignedHeaders({
+      'Content-Type': 'application/json; charset=utf-8',
+      desktopid: desktopId
+    });
+    if (desktop.foreignDesktopId) headers['x-vm-id'] = desktop.foreignDesktopId;
+    if (desktopInfo?.token) headers['x-auth-token'] = desktopInfo.token;
+
+    const res = await fetchWithTimeout(`${baseUrl}/api/desktop/client/reportOnline`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ reconnect: '1' })
+    });
+    const json = await res.json();
+    if (json.code !== 0) throw new Error(json.msg || '官方 reportOnline 上报失败');
+    return json.data || { desktopId };
+  }
+
   // 云电脑电源管理操作 (开机: operationType 1 / 唤醒: operationType 18 / 关机: operationType 2 / 重启: operationType 3)
   async controlPower(desktopId, action) {
     const accName = this.account.name || this.account.user;
@@ -1644,378 +1734,109 @@ class CtYunClient {
     this.metrics.status = 'offline';
   }
 
-  // 单台云电脑视讯通道保活会话
+  // 单台云电脑官方 API 保活会话：connectMaster + reportOnline（无自造 WebSocket/REDQ 协议）
   async runDesktopKeepAliveSession(desktop, isHangMode = false, pulseConnectSec = 20) {
     const accName = this.account.name || this.account.user;
-    const desktopId = desktop.objId || desktop.desktopId;
     const desktopName = desktop.objName || desktop.desktopName || '云电脑';
+    const durationSec = isHangMode
+      ? Math.min(3600, Math.max(60, parseInt(pulseConnectSec) || 3600))
+      : Math.min(60, Math.max(15, parseInt(pulseConnectSec) || 20));
 
     let desktopInfo = null;
-    let lastConnError = '';
-    // 挂机模式加长重试窗口 (等待开机/网关就绪)：12 次 × 10 秒 ≈ 2 分钟；脉冲模式保持轻量 4 次 × 4 秒
-    const maxConnAttempts = isHangMode ? 12 : 4;
+    let lastError = '';
+    const maxAttempts = isHangMode ? 12 : 4;
     const retryGapMs = isHangMode ? 10000 : 4000;
-    for (let connAttempt = 1; connAttempt <= maxConnAttempts; connAttempt++) {
-      try {
-        desktopInfo = await this.connect(desktopId);
-      } catch (e) {
-        lastConnError = e.message || '';
-      }
-      if (desktopInfo && desktopInfo.clinkLvsOutHost) break;
 
-      // 先判定【开机/启动中】：此类报错 (如"正在启动中，请稍后再试") 属于等待就绪，绝非客户端占用，绝不误判让位！
-      const isBootingMsg = lastConnError.includes('启动') || lastConnError.includes('开机') || lastConnError.includes('初始化') || lastConnError.includes('唤醒');
-      // 再严格判定【客户端占用】：仅明确的占用信令才视为官方客户端接入
-      const isOccupiedMsg = !isBootingMsg && (
-        lastConnError.includes('其他设备') || lastConnError.includes('其他地方') ||
-        lastConnError.includes('正在使用') || lastConnError.includes('使用中') || lastConnError.includes('占用')
-      );
-      if (isOccupiedMsg) {
-        appendLog('KeepAlive', `[${accName}][${desktopName}] 官方客户端可能正在使用，旁观通道将在下个周期自动重试。`, 'info');
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        desktopInfo = await this.connectMasterOfficial(desktop);
+        if (desktopInfo) break;
+      } catch (e) {
+        lastError = e.message || 'connectMaster 失败';
+      }
+
+      const isBooting = /启动|开机|初始化|唤醒/.test(lastError);
+      const isOccupied = !isBooting && /其他设备|其他地方|正在使用|使用中|占用/.test(lastError);
+      if (isOccupied) {
+        appendLog('KeepAlive', `[${accName}][${desktopName}] 官方客户端正在使用，已主动避让。`, 'info');
         return { success: true, reason: 'occupied' };
       }
-      if (connAttempt < maxConnAttempts) {
-        if (lastConnError) {
-          appendLog('KeepAlive', `[${accName}][${desktopName}] 连接暂未就绪 (${lastConnError})，${Math.round(retryGapMs / 1000)} 秒后自动重试 (${connAttempt}/${maxConnAttempts})...`, 'info');
-        }
+      if (attempt < maxAttempts) {
+        appendLog('KeepAlive', `[${accName}][${desktopName}] 官方连接暂未就绪 (${lastError})，${Math.round(retryGapMs / 1000)} 秒后重试 (${attempt}/${maxAttempts})...`, 'info');
         await new Promise(r => setTimeout(r, retryGapMs));
       }
     }
 
-    const targetHost = desktopInfo.clinkLvsOutHost || desktopInfo.clinkLvsInHost;
-    if (!desktopInfo || !targetHost) {
-      appendLog('KeepAlive', `[${accName}][${desktopName}] 视讯网关暂未分配完毕 (已重试 ${maxConnAttempts} 次)，跳过本次连接`, 'warning');
-      return { success: false, reason: 'no_gateway' };
+    if (!desktopInfo) {
+      appendLog('KeepAlive', `[${accName}][${desktopName}] 官方 connectMaster 失败: ${lastError}`, 'warning');
+      this.metrics.errorCount++;
+      return { success: false, reason: 'connect_master_failed' };
     }
 
-    this.metrics.currentHost = targetHost;
-    const wsUrl = `wss://${targetHost}/clinkProxy/${desktopId}/MAIN`;
+    this.metrics.currentHost = desktopInfo._officialBaseUrl || this.getOfficialDesktopBase(desktop);
+    this.metrics.keepAliveSeconds = durationSec;
+    this.metrics.cycleCountdown = durationSec;
+    this.metrics.status = 'online';
+    this.wsAlive = true;
 
-    return await new Promise((resolveSession) => {
-      let cycleDone = false;
-      let isClosingSelf = false;
-      let sessionTimeout = null;
-      let hangCheckInterval = null;
-      let wsConnectedAt = 0;
-      let clientPresenceSignal = false; // 官方客户端在席信令 (Type 119/120/137)：收到即代表真机用户接入
+    const todayStr = getBeijingDateOnly();
+    if (this.lastSuccessDate !== todayStr) {
+      this.metrics.successCount = 0;
+      this.lastSuccessDate = todayStr;
+    }
+    this.metrics.successCount++;
+    this.account.stats = this.account.stats || {};
+    this.account.stats.todaySuccessCount = this.metrics.successCount;
+    this.account.stats.lastSuccessDate = todayStr;
+    this.account.stats.keepAliveStatus = 'online';
+    saveConfig(appConfig);
 
-      const endSession = (reason) => {
-        if (cycleDone) return;
-        cycleDone = true;
-        isClosingSelf = true;
-        this.endCurrentSession = null;
-        if (sessionTimeout) clearTimeout(sessionTimeout);
-        if (this.countdownTimer) clearInterval(this.countdownTimer);
-        if (this.clinkPingTimer) {
-          clearInterval(this.clinkPingTimer);
-          this.clinkPingTimer = null;
+    appendLog('Heartbeat', `[${accName}][${desktopName}] 🟢 官方 connectMaster 成功，开始 reportOnline 保活`, 'success');
+
+    let stopped = false;
+    this.endCurrentSession = () => { stopped = true; };
+    if (this.countdownTimer) clearInterval(this.countdownTimer);
+    this.countdownTimer = setInterval(() => {
+      if (this.metrics.cycleCountdown > 0) this.metrics.cycleCountdown--;
+    }, 1000);
+
+    const startedAt = Date.now();
+    let reportCount = 0;
+    try {
+      while (!stopped && (Date.now() - startedAt) < durationSec * 1000) {
+        await this.reportOnlineOfficial(desktop, desktopInfo);
+        reportCount++;
+        const nowStr = getBeijingTimeOnly();
+        this.metrics.lastHeartbeatTime = nowStr;
+        this.metrics.lastHeartbeatResult = `[${desktopName}] 官方 reportOnline 成功 (${nowStr})`;
+        appendLog('Heartbeat', `[${accName}][${desktopName}] -> ✅ 官方 reportOnline 上报成功 (${reportCount})`, 'success');
+
+        if (isHangMode) {
+          await this.refreshOfficialTasks();
+          if (this.isTodayHangTaskCompleted()) {
+            appendLog('KeepAlive', `[${accName}][${desktopName}] 今日挂机任务已达成，结束官方 API 保活。`, 'success');
+            break;
+          }
         }
-        if (hangCheckInterval) {
-          clearInterval(hangCheckInterval);
-          hangCheckInterval = null;
-        }
-        if (this.ws) {
-          try { this.ws.close(); } catch (e) {}
-        }
-        this.wsAlive = false;
-        resolveSession({ success: true, reason });
-      };
 
-      this.endCurrentSession = endSession;
-
-      this.resetCycleTimeout = (newSeconds) => {
-        if (cycleDone) return;
-        if (sessionTimeout) clearTimeout(sessionTimeout);
-        this.metrics.keepAliveSeconds = newSeconds;
-        this.metrics.cycleCountdown = newSeconds;
-        sessionTimeout = setTimeout(() => {
-          appendLog('Heartbeat', `[${accName}][${desktopName}] 周期时间到 (${newSeconds}s)，强制重连刷新天翼云会话...`, 'info');
-          endSession('Timeout Reset');
-        }, newSeconds * 1000);
-      };
-
-      if (isHangMode) {
-        // 挂机会话时长：主挂机 3600 秒，尾差补挂按传入轮次时长 (上限 3600 秒)
-        const maxHangTimeout = Math.min(3600, Math.max(60, parseInt(pulseConnectSec) || 3600));
-        this.metrics.keepAliveSeconds = maxHangTimeout;
-        this.metrics.cycleCountdown = maxHangTimeout;
-        sessionTimeout = setTimeout(() => {
-          appendLog('Heartbeat', `[${accName}][${desktopName}] 挂机长连接看门狗周期到 (${maxHangTimeout}s)，平滑刷新会话...`, 'info');
-          endSession('Hang Watchdog');
-        }, maxHangTimeout * 1000);
-      } else {
-        const connectSec = Math.min(60, Math.max(15, pulseConnectSec));
-        this.metrics.keepAliveSeconds = connectSec;
-        this.metrics.cycleCountdown = connectSec;
-        sessionTimeout = setTimeout(() => {
-          appendLog('Heartbeat', `[${accName}][${desktopName}] 脉冲握手完成 (${connectSec}s)，释放通道待机...`, 'info');
-          endSession('Pulse Finished');
-        }, connectSec * 1000);
+        const remainingMs = durationSec * 1000 - (Date.now() - startedAt);
+        if (remainingMs <= 0 || stopped) break;
+        await new Promise(r => setTimeout(r, Math.min(30000, remainingMs)));
       }
-
-      if (this.countdownTimer) clearInterval(this.countdownTimer);
-      this.countdownTimer = setInterval(() => {
-        if (this.metrics.cycleCountdown > 0) {
-          this.metrics.cycleCountdown--;
-        }
-      }, 1000);
-
-      this.ws = new WebSocket(wsUrl, {
-        headers: { Origin: 'https://pc.ctyun.cn' },
-        rejectUnauthorized: false
-      });
-
-      const safeSend = (data) => {
-        try {
-          if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-            this.ws.send(data);
-          }
-        } catch (err) {
-          appendLog('Heartbeat', `[${accName}][${desktopName}] 报文发送异常: ${err.message}`, 'warning');
-        }
-      };
-
-      this.ws.on('open', () => {
-        wsConnectedAt = Date.now();
-        this.sessionConflictStreak = 0;
-        this.conflictRetryUntil = 0;
-        this.wsAlive = true;
-        this.metrics.status = 'online';
-
-        // 当日成功轮次按自然日 0 点重置统计
-        const todayStr = getBeijingDateOnly();
-        if (this.lastSuccessDate !== todayStr) {
-          this.metrics.successCount = 0;
-          this.lastSuccessDate = todayStr;
-        }
-        this.metrics.successCount++;
-        this.account.stats = this.account.stats || {};
-        this.account.stats.todaySuccessCount = this.metrics.successCount;
-        this.account.stats.lastSuccessDate = todayStr;
-        this.account.stats.keepAliveStatus = 'online';
-        saveConfig(appConfig);
-
-        appendLog('Heartbeat', `[${accName}][${desktopName}] 🟢 保活长连接就绪 (${this.metrics.currentHost})`, 'success');
-
-        const hostParts = (targetHost || '').split(':');
-        const connectMsg = {
-          type: 1,
-          ssl: 1,
-          host: hostParts[0],
-          port: hostParts[1] || '443',
-          ca: desktopInfo.caCert,
-          cert: desktopInfo.clientCert,
-          key: desktopInfo.clientKey,
-          servername: desktopInfo.host + ':' + desktopInfo.port,
-          oqs: 0
-        };
-        safeSend(JSON.stringify(connectMsg));
-
-        setTimeout(() => {
-          const initBuf = Buffer.from('UkVEUQIAAAACAAAAGgAAAAAAAAABAAEAAAABAAAAEgAAAAkAAAAECAAA', 'base64');
-          safeSend(initBuf);
-          appendLog('Heartbeat', `[${accName}][${desktopName}] 已发送保活特征码报文 (UkVEUQIA...)`, 'info');
-        }, 500);
-      });
-
-      this.ws.on('message', (data) => {
-        try {
-          const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-          const hex = buf.toString('hex').toUpperCase();
-
-          this.wsAlive = true;
-          this.metrics.status = 'online';
-          if (this.account.stats) this.account.stats.keepAliveStatus = 'online';
-
-          if (hex.startsWith('52454451')) {
-            const nowStr = getBeijingTimeOnly();
-            appendLog('Heartbeat', `[${accName}][${desktopName}] 收到服务端保活校验 REDQ (${buf.length}B)`, 'info');
-
-            const responseBuf = this.encryptor.execute(buf);
-            safeSend(responseBuf);
-
-            this.metrics.lastHeartbeatTime = nowStr;
-            this.metrics.lastHeartbeatResult = `[${desktopName}] REDQ 校验成功，已回传 ${responseBuf.length} 字节加密应答 (${nowStr})`;
-            appendLog('Heartbeat', `[${accName}][${desktopName}] -> ✅ 成功回传 RSA-OAEP 加密应答 (${responseBuf.length}B)`, 'success');
-            return;
-          }
-
-          if (buf.length >= 6) {
-            const type = buf.readUInt16LE(0);
-            const size = buf.readUInt32LE(2);
-
-            if (type === 4) {
-              const pongBuf = Buffer.alloc(6 + Math.min(size, 12));
-              pongBuf.writeUInt16LE(3, 0);
-              pongBuf.writeUInt32LE(Math.min(size, 12), 2);
-              if (size > 0 && buf.length >= 6 + Math.min(size, 12)) {
-                buf.copy(pongBuf, 6, 6, 6 + Math.min(size, 12));
-              }
-              safeSend(pongBuf);
-              return;
-            }
-
-            if (type === 3 && size >= 8) {
-              const gen = buf.readUInt32LE(6);
-              const ackBuf = Buffer.alloc(10);
-              ackBuf.writeUInt16LE(1, 0);
-              ackBuf.writeUInt32LE(4, 2);
-              ackBuf.writeUInt32LE(gen, 6);
-              safeSend(ackBuf);
-              return;
-            }
-
-            if (type === 103) {
-              appendLog('Heartbeat', `[${accName}][${desktopName}] 收到云电脑 103 认证，正在上报 118 用户身份...`, 'info');
-              const userPayload = Buffer.from(JSON.stringify({
-                type: 1,
-                userName: this.loginInfo.userName,
-                userInfo: '',
-                userId: this.loginInfo.userId
-              }));
-
-              const sendBuf = Buffer.alloc(2 + 4 + 8 + userPayload.length);
-              sendBuf.writeUInt16LE(118, 0);
-              sendBuf.writeInt32LE(8 + userPayload.length, 2);
-              sendBuf.writeUInt32LE(userPayload.length, 6);
-              sendBuf.writeUInt32LE(8, 10);
-              userPayload.copy(sendBuf, 14);
-
-              safeSend(sendBuf);
-              appendLog('Heartbeat', `[${accName}][${desktopName}] -> ✅ 已回传 118 身份 (用户ID: ${this.loginInfo.userId})，在线状态已激活！`, 'success');
-
-              if (isHangMode) {
-                try {
-                  const sId = desktopInfo.token || '';
-                  const dType = this.deviceType ? String(this.deviceType) : '';
-                  const dCode = this.account.deviceCode || '';
-                  const uAcc = this.loginInfo.userName || '';
-
-                  const sIdLen = Buffer.byteLength(sId, 'utf8') + 1;
-                  const dTypeLen = Buffer.byteLength(dType, 'utf8') + 1;
-                  const dCodeLen = Buffer.byteLength(dCode, 'utf8') + 1;
-                  const uAccLen = Buffer.byteLength(uAcc, 'utf8') + 1;
-
-                  const dataSize = 36 + sIdLen + dTypeLen + dCodeLen + uAccLen;
-                  const dataBuf = Buffer.alloc(dataSize);
-                  let offset = 0;
-                  let strOffset = 36;
-
-                  dataBuf.writeUInt32LE(Number(desktopId), offset); offset += 4;
-                  dataBuf.writeUInt32LE(sIdLen, offset); offset += 4;
-                  dataBuf.writeUInt32LE(strOffset, offset); offset += 4; strOffset += sIdLen;
-                  dataBuf.writeUInt32LE(dTypeLen, offset); offset += 4;
-                  dataBuf.writeUInt32LE(strOffset, offset); offset += 4; strOffset += dTypeLen;
-                  dataBuf.writeUInt32LE(dCodeLen, offset); offset += 4;
-                  dataBuf.writeUInt32LE(strOffset, offset); offset += 4; strOffset += dCodeLen;
-                  dataBuf.writeUInt32LE(uAccLen, offset); offset += 4;
-                  dataBuf.writeUInt32LE(strOffset, offset); offset += 4; strOffset += uAccLen;
-
-                  dataBuf.write(sId, offset, 'utf8'); offset += sIdLen;
-                  dataBuf.write(dType, offset, 'utf8'); offset += dTypeLen;
-                  dataBuf.write(dCode, offset, 'utf8'); offset += dCodeLen;
-                  dataBuf.write(uAcc, offset, 'utf8'); offset += uAccLen;
-
-                  const msgBuf112 = Buffer.alloc(6 + dataSize);
-                  msgBuf112.writeUInt16LE(112, 0);
-                  msgBuf112.writeUInt32LE(dataSize, 2);
-                  dataBuf.copy(msgBuf112, 6);
-
-                  safeSend(msgBuf112);
-                } catch (e) {}
-
-                try {
-                  const msgBuf104 = Buffer.alloc(6);
-                  msgBuf104.writeUInt16LE(104, 0);
-                  msgBuf104.writeUInt32LE(0, 2);
-                  safeSend(msgBuf104);
-                } catch (e) {}
-              } else {
-                appendLog('Heartbeat', `[${accName}][${desktopName}] 脉冲旁观者模式已激活：不认领桌面会话 (无 112/104)，官方客户端随时接入永不被踢。`, 'info');
-              }
-
-              if (this.clinkPingTimer) clearInterval(this.clinkPingTimer);
-              this.clinkPingTimer = setInterval(() => {
-                if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-                  const hbBuf = Buffer.alloc(6);
-                  hbBuf.writeUInt16LE(7, 0);
-                  hbBuf.writeUInt32LE(0, 2);
-                  safeSend(hbBuf);
-                }
-              }, 5000);
-
-              if (isHangMode) {
-                const checkHangProgress = async () => {
-                  if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-                  await this.refreshOfficialTasks();
-                  const hangTask = this.metrics.officialTasks?.find(t => t.name.includes('使用1小时'));
-                  const curSec = hangTask ? (hangTask.current || 0) : 0;
-                  const totSec = hangTask ? (hangTask.total || 3600) : 3600;
-
-                  if (curSec >= totSec || (hangTask && hangTask.status === 2)) {
-                    if (hangCheckInterval) clearInterval(hangCheckInterval);
-                    appendLog('KeepAlive', `[${accName}][${desktopName}] 🎉 恭喜！今日使用 AI 云电脑 1 小时挂机任务已圆满达成 (+100积分)！后台长连接立即主动让位关闭，转入脉冲保活防休眠模式。`, 'success');
-                    sendAccountNotification(
-                      this.account,
-                      `🎉 挂机1小时任务达成 - ${accName}`,
-                      `账号【${accName}】今日使用 AI 云电脑达到 1 小时任务已完成，100 积分已入账！`
-                    );
-                    endSession('Today Hang Goal Achieved');
-                  } else {
-                    const curMin = Math.floor(curSec / 60);
-                    const totMin = Math.floor(totSec / 60);
-                    const remainSec = Math.max(0, totSec - curSec);
-                    this.metrics.lastHeartbeatResult = `[${desktopName}] 挂机累加中: 已在线 ${curMin}/${totMin} 分钟 (${curSec}/${totSec}秒，剩余约 ${Math.ceil(remainSec / 60)} 分钟)`;
-                    this.metrics.cycleCountdown = remainSec;
-                  }
-                };
-
-                setTimeout(checkHangProgress, 2500);
-                hangCheckInterval = setInterval(checkHangProgress, 15000);
-              } else {
-                this.metrics.lastHeartbeatResult = `[${desktopName}] 脉冲保活握手就绪，已向网关发送 REDQ/心跳`;
-              }
-            }
-
-            if (type === 119 || type === 120 || type === 137) {
-              // 官方客户端在席信令：真机用户已接入。挂机模式下若随后被断开，据此判定为真实抢占而非网络闪断
-              clientPresenceSignal = true;
-              appendLog('Heartbeat', `[${accName}][${desktopName}] 收到客户端在席信令 (${type})，官方客户端已接入使用。`, 'info');
-              return;
-            }
-          }
-        } catch (err) {
-          appendLog('Heartbeat', `[${accName}][${desktopName}] 解析报文异常: ${err.message}`, 'warning');
-        }
-      });
-
-      this.ws.on('error', (err) => {
-        appendLog('Heartbeat', `[${accName}][${desktopName}] 通道异常: ${err.message || '连接受阻'}`, 'error');
-        this.metrics.errorCount++;
-        endSession('Socket Error');
-      });
-
-      this.ws.on('close', (code, reason) => {
-        const reasonStr = String(reason || '');
-        const heldSec = wsConnectedAt ? Math.floor((Date.now() - wsConnectedAt) / 1000) : 0;
-
-        if (isClosingSelf) {
-          appendLog('Heartbeat', `[${accName}][${desktopName}] 保活长连接正常轮转关闭 (${code} - ${reason || '周期重连'})`, 'info');
-        } else if (code >= 4000 || reasonStr.includes('preempt') || reasonStr.includes('kick') || reasonStr.includes('conflict')) {
-          appendLog('Heartbeat', `[${accName}][${desktopName}] 收到网关抢占信令 (${code})，确认为官方客户端接入信号。`, 'info');
-          endSession('Preempted by Client');
-          return;
-        } else if (clientPresenceSignal) {
-          // 断开前收到过 Type 119/120/137 在席信令：这是官方客户端接入导致的踢线，绝非网络抖动，绝不盲目重连争抢！
-          appendLog('Heartbeat', `[${accName}][${desktopName}] 断开前收到官方客户端在席信令，判定为真机接入抢占 (状态码: ${code}，已保持 ${heldSec} 秒)。`, 'info');
-          endSession('Preempted by Client');
-          return;
-        } else {
-          appendLog('Heartbeat', `[${accName}][${desktopName}] 通道被网关断开 (状态码: ${code}，已保持 ${heldSec} 秒)，属网络/网关抖动，挂机将自动重连。`, 'info');
-        }
-        endSession('Closed');
-      });
-    });
+      return { success: true, reason: stopped ? 'Yielded' : 'Official API Finished' };
+    } catch (e) {
+      this.metrics.errorCount++;
+      this.metrics.lastHeartbeatResult = `[${desktopName}] 官方 reportOnline 失败: ${e.message}`;
+      appendLog('Heartbeat', `[${accName}][${desktopName}] 官方 API 保活异常: ${e.message}`, 'error');
+      return { success: false, reason: 'report_online_failed', error: e.message };
+    } finally {
+      this.endCurrentSession = null;
+      if (this.countdownTimer) {
+        clearInterval(this.countdownTimer);
+        this.countdownTimer = null;
+      }
+      this.wsAlive = false;
+    }
   }
 
   /**
